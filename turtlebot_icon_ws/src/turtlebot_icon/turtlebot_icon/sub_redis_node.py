@@ -19,17 +19,18 @@ class wlsFilter:
         self._sigma = _sigma
         self.wlsFilter = cv2.ximgproc.createDisparityWLSFilterGeneric(False)
 
-    def filter(self, disparity, right, depthScaleFactor):
+    def filter(self, disparity, guide_img, depthScaleFactor):
         # https://github.com/opencv/opencv_contrib/blob/master/modules/ximgproc/include/opencv2/ximgproc/disparity_filter.hpp#L92
         self.wlsFilter.setLambda(self._lambda)
         # https://github.com/opencv/opencv_contrib/blob/master/modules/ximgproc/include/opencv2/ximgproc/disparity_filter.hpp#L99
         self.wlsFilter.setSigmaColor(self._sigma)
-        filteredDisp = self.wlsFilter.filter(disparity, right)
-
+        filteredDisp = self.wlsFilter.filter(disparity, guide_img)
+        filteredDisp[filteredDisp == np.inf] = 0
+        
         # Compute depth from disparity (32 levels)
         with np.errstate(divide='ignore'): # Should be safe to ignore div by zero here
             # raw depth values
-            depthFrame = (depthScaleFactor / filteredDisp)
+            depthFrame = (depthScaleFactor / filteredDisp.astype(np.float32)).astype(np.uint16)
 
         return filteredDisp, depthFrame
     
@@ -40,7 +41,7 @@ class sub_redis_node(Node):
         super().__init__('sub_redis_node')
         # define some variable
         self.bridge = CvBridge()
-        self.maxDepth = 10*1000
+        self.maxDepth = 3*1000
         self.baseline = 75 # mm 
         self.fov = 72.9 # deg
 
@@ -62,13 +63,11 @@ class sub_redis_node(Node):
             Image, f'/{bot_name}/oakd/stereo/image_raw', self.depth_image_callback, qos_profile_sensor_data)
         self.subscription3 = self.create_subscription(
             PoseStamped, f'/vicon/{bot_name}/{bot_name}/pose', self.vicon_data_callback, qos_profile_sensor_data)
-        self.subscription4 = self.create_subscription(
-            Image, f'/{bot_name}/oakd/right/image_rect', self.rimg_callback, qos_profile_sensor_data)
-        
+
         self.save_path = save_path
         self.counter = 0
 
-        self.wlsfilter =  wlsFilter(_lambda=8000, _sigma=1.5)
+        self.wlsfilter =  wlsFilter(_lambda=10*1000, _sigma=5)
 
         
 
@@ -83,12 +82,6 @@ class sub_redis_node(Node):
             self.rgb_time_list.pop(0)
 
 
-    def rimg_callback(self, msg: Image):
-        rimg = self.bridge.imgmsg_to_cv2(msg)
-        self.rimg_list.append(rimg)
-        self.rimg_time_list.append(msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec)
-
-
     def vicon_data_callback(self, msg: PoseStamped):
         self.pose_list.append(msg)
         self.pose_time_list.append(msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec)
@@ -99,36 +92,30 @@ class sub_redis_node(Node):
             self.pose_time_list.pop(0)
 
 
-
-
     def depth_image_callback(self, msg: Image):
         depth_image = self.bridge.imgmsg_to_cv2(msg, "16UC1") # get unint16
-        depth_image = np.clip(depth_image, 0, self.maxDepth)
         
-        self.send_data_to_redis('depth_image', depth_image)
         depth_time = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
-
         
         # Save depth_image
         self.counter += 1 
         cv2.imwrite(self.save_path+f'/depth_{self.counter}.png', depth_image)
 
         # Find closest timestamp for RGB image
-        if (len(self.rgb_time_list) > 0) and (len(self.rimg_time_list) > 0):
+        if len(self.rgb_time_list) > 0:
             closest_rgb_idx = np.argmin( np.abs(np.array(self.rgb_time_list) - depth_time) )
-            closest_rimg_idx = np.argmin( np.abs(np.array(self.rimg_time_list) - depth_time) )
             closest_rgb_image = self.rgb_list[closest_rgb_idx]
-            closest_rimg = self.rimg_list[closest_rimg_idx]
             # apply filter 
             focal = depth_image.shape[1] / (2. * math.tan(math.radians(self.fov / 2)))
             depthScaleFactor = self.baseline * focal
             filteredDisp, depthFrame = self.wlsfilter.filter(depth_image, closest_rgb_image, depthScaleFactor)
+            self.send_data_to_redis('depth_image', depthFrame)
 
             # Save closest_rgb_image
             cv2.imwrite(self.save_path+f'/rgb_{self.counter}.png', closest_rgb_image )
             # send
             self.send_data_to_redis('rgb_image', cv2.cvtColor(closest_rgb_image, cv2.COLOR_BGR2RGB) )
-            self.blend_and_show(closest_rgb_image, closest_rimg, filteredDisp)
+            self.blend_and_show(closest_rgb_image, depthFrame)
 
 
 
@@ -151,13 +138,15 @@ class sub_redis_node(Node):
         self.redis_client.set(key, pickled_data)
 
 
-    def blend_and_show(self, rgb_image, rimg, depth_image):
+    def blend_and_show(self, rgb_image, depth_image):
         if rgb_image is not None and depth_image is not None:
-            depth_image_8bit = (depth_image * 255. / self.maxDepth * 10 ).astype(np.uint8)
+            depth_image = np.clip(depth_image, a_min=0, a_max=self.maxDepth)
+            depth_image_8bit = (depth_image * 255. / self.maxDepth).astype(np.uint8)
             colorDepth = cv2.applyColorMap(depth_image_8bit, cv2.COLORMAP_HOT)
-            #blended_image = cv2.addWeighted(rgb_image, 0.1, depth_3ch, 0.9, 0)
+            blended_image = cv2.addWeighted(rgb_image, 0.2, colorDepth, 0.8, 0)
             cv2.imshow('Depth Image', colorDepth)
             cv2.imshow('RGB', rgb_image)
+            cv2.imshow('Blended', blended_image)
             cv2.waitKey(1)
 
 
